@@ -1397,13 +1397,19 @@
 
   .allocation-account {
     flex: 1;
+    min-width: 0;
     padding-right: 28px;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
   }
 
   .allocation-type {
-    width: 65px;
-    padding-right: 24px;
-    background-position: right 6px center;
+    width: 55px;
+    min-width: 55px;
+    flex-shrink: 0;
+    padding-right: 20px;
+    background-position: right 4px center;
   }
 
   .allocation-account:focus,
@@ -1420,7 +1426,9 @@
   }
 
   .allocation-value {
-    width: 90px;
+    width: 70px;
+    min-width: 70px;
+    flex-shrink: 0;
     padding: 8px;
     background: var(--bg-primary);
     border: 1px solid var(--border-primary);
@@ -1428,6 +1436,14 @@
     color: var(--text-primary);
     font-size: 13px;
     font-family: var(--font-mono);
+    /* Hide native number spinners */
+    -moz-appearance: textfield;
+  }
+
+  .allocation-value::-webkit-outer-spin-button,
+  .allocation-value::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
   }
 
   .allocation-value:focus {
