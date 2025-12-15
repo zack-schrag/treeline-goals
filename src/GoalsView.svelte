@@ -1236,9 +1236,9 @@
     border: 1px solid var(--border-primary);
     border-radius: 8px;
     padding: var(--spacing-lg);
-    width: 450px;
-    max-width: 90vw;
-    max-height: 90vh;
+    width: 520px;
+    max-width: 95vw;
+    max-height: 85vh;
     overflow-y: auto;
   }
 
