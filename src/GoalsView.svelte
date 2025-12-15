@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { PluginSDK, Goal, Account } from "./types";
+  import type { PluginSDK, Goal, Account, AccountAllocation } from "./types";
 
   // Props from plugin SDK
   const { sdk }: { sdk: PluginSDK } = $props();
@@ -21,15 +21,19 @@
   let editingGoal = $state<Goal | null>(null);
   let showCompleted = $state(false);
 
-  // Form state
-  let newGoal = $state<Partial<Goal>>({
-    name: "",
-    target_amount: 0,
-    target_date: null,
-    account_ids: null,
-    icon: "🎯",
-    color: "#3b82f6",
-  });
+  // Form state for new goal
+  interface FormAllocation {
+    account_id: string;
+    allocation_type: "percentage" | "fixed";
+    allocation_value: number;
+  }
+
+  let newGoalName = $state("");
+  let newGoalTargetAmount = $state(0);
+  let newGoalTargetDate = $state<string | null>(null);
+  let newGoalIcon = $state("🎯");
+  let newGoalColor = $state("#3b82f6");
+  let newGoalAllocations = $state<FormAllocation[]>([]);
 
   // Preset goal templates
   const goalTemplates = [
@@ -61,13 +65,27 @@
   }
 
   async function ensureTablesExist() {
+    // Drop old table if it has the old schema (account_ids instead of allocations)
+    // This is a dev-time migration - in production you'd do proper migrations
+    try {
+      const cols = await sdk.query<unknown[]>(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'sys_plugin_goals' AND column_name = 'account_ids'
+      `);
+      if (cols.length > 0) {
+        await sdk.execute(`DROP TABLE IF EXISTS sys_plugin_goals`);
+      }
+    } catch {
+      // Table doesn't exist yet, that's fine
+    }
+
     await sdk.execute(`
       CREATE TABLE IF NOT EXISTS sys_plugin_goals (
         id VARCHAR PRIMARY KEY,
         name VARCHAR NOT NULL,
         target_amount DECIMAL(15,2) NOT NULL,
         target_date DATE,
-        account_ids JSON,
+        allocations JSON,
         starting_balance DECIMAL(15,2) NOT NULL DEFAULT 0,
         icon VARCHAR NOT NULL DEFAULT '🎯',
         color VARCHAR NOT NULL DEFAULT '#3b82f6',
@@ -81,14 +99,24 @@
   }
 
   async function loadAccounts() {
-    // SDK returns rows as arrays
+    // Get accounts with latest balance from snapshots
+    // Uses a subquery to get the most recent snapshot per account
     const result = await sdk.query<unknown[]>(`
       SELECT
-        account_id,
-        COALESCE(nickname, name) as name,
-        COALESCE(balance, 0) as balance,
-        account_type
-      FROM accounts
+        a.account_id,
+        COALESCE(a.nickname, a.name) as name,
+        COALESCE(latest.balance, a.balance, 0) as balance,
+        a.account_type
+      FROM accounts a
+      LEFT JOIN (
+        SELECT account_id, balance
+        FROM sys_balance_snapshots s1
+        WHERE snapshot_time = (
+          SELECT MAX(snapshot_time)
+          FROM sys_balance_snapshots s2
+          WHERE s2.account_id = s1.account_id
+        )
+      ) latest ON a.account_id = latest.account_id
       ORDER BY name
     `);
 
@@ -102,7 +130,7 @@
 
   async function loadGoals() {
     const result = await sdk.query<unknown[]>(`
-      SELECT id, name, target_amount, target_date, account_ids, starting_balance,
+      SELECT id, name, target_amount, target_date, allocations, starting_balance,
              icon, color, active, completed, completed_at, created_at, updated_at
       FROM sys_plugin_goals
       ORDER BY completed ASC, created_at DESC
@@ -113,7 +141,7 @@
       name: row[1] as string,
       target_amount: Number(row[2]) || 0,
       target_date: row[3] as string | null,
-      account_ids: row[4] ? JSON.parse(row[4] as string) : null,
+      allocations: row[4] ? JSON.parse(row[4] as string) : null,
       starting_balance: Number(row[5]) || 0,
       icon: row[6] as string,
       color: row[7] as string,
@@ -129,13 +157,19 @@
     const balances = new Map<string, number>();
 
     for (const goal of goals) {
-      if (goal.account_ids && goal.account_ids.length > 0) {
-        // Sum balances of linked accounts
+      if (goal.allocations && goal.allocations.length > 0) {
+        // Sum allocated amounts from linked accounts
         let total = 0;
-        for (const accountId of goal.account_ids) {
-          const account = accounts.find((a) => a.account_id === accountId);
+        for (const alloc of goal.allocations) {
+          const account = accounts.find((a) => a.account_id === alloc.account_id);
           if (account) {
-            total += account.balance;
+            if (alloc.allocation_type === "percentage") {
+              // Percentage of account balance
+              total += (account.balance * alloc.allocation_value) / 100;
+            } else {
+              // Fixed amount (capped at account balance)
+              total += Math.min(alloc.allocation_value, account.balance);
+            }
           }
         }
         balances.set(goal.id, total);
@@ -153,43 +187,45 @@
   // ============================================================================
 
   async function createGoal() {
-    if (!newGoal.name || !newGoal.target_amount) {
+    if (!newGoalName || !newGoalTargetAmount) {
       sdk.toast.error("Name and target amount are required");
       return;
     }
 
     const id = crypto.randomUUID();
-    const accountIdsJson = newGoal.account_ids
-      ? JSON.stringify(newGoal.account_ids)
-      : "NULL";
+    const allocationsJson = newGoalAllocations.length > 0
+      ? JSON.stringify(newGoalAllocations)
+      : null;
 
-    // Calculate starting balance from linked accounts
+    // Calculate starting balance from allocations
     let startingBalance = 0;
-    if (newGoal.account_ids && newGoal.account_ids.length > 0) {
-      for (const accountId of newGoal.account_ids) {
-        const account = accounts.find((a) => a.account_id === accountId);
-        if (account) {
-          startingBalance += account.balance;
+    for (const alloc of newGoalAllocations) {
+      const account = accounts.find((a) => a.account_id === alloc.account_id);
+      if (account) {
+        if (alloc.allocation_type === "percentage") {
+          startingBalance += (account.balance * alloc.allocation_value) / 100;
+        } else {
+          startingBalance += Math.min(alloc.allocation_value, account.balance);
         }
       }
     }
 
     await sdk.execute(`
       INSERT INTO sys_plugin_goals
-        (id, name, target_amount, target_date, account_ids, starting_balance, icon, color)
+        (id, name, target_amount, target_date, allocations, starting_balance, icon, color)
       VALUES (
         '${id}',
-        '${escapeSql(newGoal.name)}',
-        ${newGoal.target_amount},
-        ${newGoal.target_date ? `'${newGoal.target_date}'` : "NULL"},
-        ${newGoal.account_ids ? `'${accountIdsJson}'` : "NULL"},
+        '${escapeSql(newGoalName)}',
+        ${newGoalTargetAmount},
+        ${newGoalTargetDate ? `'${newGoalTargetDate}'` : "NULL"},
+        ${allocationsJson ? `'${escapeSql(JSON.stringify(newGoalAllocations))}'` : "NULL"},
         ${startingBalance},
-        '${newGoal.icon || "🎯"}',
-        '${newGoal.color || "#3b82f6"}'
+        '${newGoalIcon || "🎯"}',
+        '${newGoalColor || "#3b82f6"}'
       )
     `);
 
-    sdk.toast.success(`Goal "${newGoal.name}" created!`);
+    sdk.toast.success(`Goal "${newGoalName}" created!`);
     showAddGoal = false;
     resetForm();
     await loadGoals();
@@ -197,16 +233,16 @@
   }
 
   async function updateGoal(goal: Goal) {
-    const accountIdsJson = goal.account_ids
-      ? JSON.stringify(goal.account_ids)
-      : "NULL";
+    const allocationsJson = goal.allocations
+      ? JSON.stringify(goal.allocations)
+      : null;
 
     await sdk.execute(`
       UPDATE sys_plugin_goals SET
         name = '${escapeSql(goal.name)}',
         target_amount = ${goal.target_amount},
         target_date = ${goal.target_date ? `'${goal.target_date}'` : "NULL"},
-        account_ids = ${goal.account_ids ? `'${accountIdsJson}'` : "NULL"},
+        allocations = ${allocationsJson ? `'${escapeSql(allocationsJson)}'` : "NULL"},
         icon = '${goal.icon}',
         color = '${goal.color}',
         updated_at = CURRENT_TIMESTAMP
@@ -249,28 +285,66 @@
   }
 
   function resetForm() {
-    newGoal = {
-      name: "",
-      target_amount: 0,
-      target_date: null,
-      account_ids: null,
-      icon: "🎯",
-      color: "#3b82f6",
-    };
+    newGoalName = "";
+    newGoalTargetAmount = 0;
+    newGoalTargetDate = null;
+    newGoalIcon = "🎯";
+    newGoalColor = "#3b82f6";
+    newGoalAllocations = [];
   }
 
   function applyTemplate(template: (typeof goalTemplates)[0]) {
-    newGoal.name = template.name;
-    newGoal.icon = template.icon;
-    newGoal.color = template.color;
+    newGoalName = template.name;
+    newGoalIcon = template.icon;
+    newGoalColor = template.color;
     if ("amount" in template) {
-      newGoal.target_amount = template.amount;
+      newGoalTargetAmount = template.amount;
     }
     // For emergency fund, calculate from monthly expenses
     if ("months" in template && template.months) {
       // This would need expense calculation - for now use placeholder
-      newGoal.target_amount = 10000; // Default, user can adjust
+      newGoalTargetAmount = 10000; // Default, user can adjust
     }
+  }
+
+  function addAllocation() {
+    if (accounts.length === 0) return;
+    // Find first account not already allocated
+    const usedIds = new Set(newGoalAllocations.map(a => a.account_id));
+    const available = accounts.find(a => !usedIds.has(a.account_id));
+    if (!available) {
+      sdk.toast.warning("All accounts already allocated");
+      return;
+    }
+    newGoalAllocations = [...newGoalAllocations, {
+      account_id: available.account_id,
+      allocation_type: "percentage" as const,
+      allocation_value: 100,
+    }];
+  }
+
+  function removeAllocation(index: number) {
+    newGoalAllocations = newGoalAllocations.filter((_, i) => i !== index);
+  }
+
+  function addEditAllocation(goal: Goal) {
+    if (!goal.allocations) goal.allocations = [];
+    const usedIds = new Set(goal.allocations.map(a => a.account_id));
+    const available = accounts.find(a => !usedIds.has(a.account_id));
+    if (!available) {
+      sdk.toast.warning("All accounts already allocated");
+      return;
+    }
+    goal.allocations = [...goal.allocations, {
+      account_id: available.account_id,
+      allocation_type: "percentage" as const,
+      allocation_value: 100,
+    }];
+  }
+
+  function removeEditAllocation(goal: Goal, index: number) {
+    if (!goal.allocations) return;
+    goal.allocations = goal.allocations.filter((_, i) => i !== index);
   }
 
   // ============================================================================
@@ -500,13 +574,20 @@
                 {/if}
               </div>
 
-              {#if goal.account_ids && goal.account_ids.length > 0}
+              {#if goal.allocations && goal.allocations.length > 0}
                 <div class="goal-accounts">
                   <span class="accounts-label">Tracking:</span>
-                  {#each goal.account_ids as accountId}
-                    {@const account = accounts.find((a) => a.account_id === accountId)}
+                  {#each goal.allocations as alloc}
+                    {@const account = accounts.find((a) => a.account_id === alloc.account_id)}
                     {#if account}
-                      <span class="account-tag">{account.name}</span>
+                      <span class="account-tag">
+                        {account.name}
+                        {#if alloc.allocation_type === "percentage"}
+                          ({alloc.allocation_value}%)
+                        {:else}
+                          ({formatCurrency(alloc.allocation_value)})
+                        {/if}
+                      </span>
                     {/if}
                   {/each}
                 </div>
@@ -592,14 +673,14 @@
               Icon
               <input
                 type="text"
-                bind:value={newGoal.icon}
+                bind:value={newGoalIcon}
                 class="icon-input"
                 maxlength="2"
               />
             </label>
             <label class="form-label color-label">
               Color
-              <input type="color" bind:value={newGoal.color} class="color-input" />
+              <input type="color" bind:value={newGoalColor} class="color-input" />
             </label>
           </div>
 
@@ -607,7 +688,7 @@
             Goal Name
             <input
               type="text"
-              bind:value={newGoal.name}
+              bind:value={newGoalName}
               placeholder="e.g., Emergency Fund"
             />
           </label>
@@ -616,7 +697,7 @@
             Target Amount
             <input
               type="number"
-              bind:value={newGoal.target_amount}
+              bind:value={newGoalTargetAmount}
               step="100"
               min="0"
               placeholder="10000"
@@ -625,26 +706,51 @@
 
           <label class="form-label">
             Target Date (optional)
-            <input type="date" bind:value={newGoal.target_date} />
+            <input type="date" bind:value={newGoalTargetDate} />
           </label>
 
-          <label class="form-label">
-            Track Account(s)
-            <select
-              multiple
-              bind:value={newGoal.account_ids}
-              class="account-select"
-            >
-              {#each accounts as account}
-                <option value={account.account_id}>
-                  {account.name} ({formatCurrency(account.balance)})
-                </option>
+          <div class="allocations-section">
+            <div class="allocations-header">
+              <span class="form-label">Account Allocations</span>
+              <button type="button" class="btn text small" onclick={addAllocation}>
+                + Add Account
+              </button>
+            </div>
+            {#if newGoalAllocations.length === 0}
+              <p class="form-hint">No accounts linked. Goal will be tracked manually.</p>
+            {:else}
+              {#each newGoalAllocations as alloc, i}
+                <div class="allocation-row">
+                  <select bind:value={alloc.account_id} class="allocation-account">
+                    {#each accounts as account}
+                      <option value={account.account_id}>
+                        {account.name} ({formatCurrency(account.balance)})
+                      </option>
+                    {/each}
+                  </select>
+                  <select bind:value={alloc.allocation_type} class="allocation-type">
+                    <option value="percentage">%</option>
+                    <option value="fixed">$</option>
+                  </select>
+                  <input
+                    type="number"
+                    bind:value={alloc.allocation_value}
+                    class="allocation-value"
+                    min="0"
+                    max={alloc.allocation_type === "percentage" ? 100 : undefined}
+                    step={alloc.allocation_type === "percentage" ? 1 : 100}
+                  />
+                  <button
+                    type="button"
+                    class="btn-icon danger"
+                    onclick={() => removeAllocation(i)}
+                  >
+                    ✕
+                  </button>
+                </div>
               {/each}
-            </select>
-            <span class="form-hint">
-              Hold {sdk.modKey} to select multiple. Leave empty for manual tracking.
-            </span>
-          </label>
+            {/if}
+          </div>
         </div>
 
         <div class="modal-actions">
@@ -708,20 +814,48 @@
             <input type="date" bind:value={editingGoal.target_date} />
           </label>
 
-          <label class="form-label">
-            Track Account(s)
-            <select
-              multiple
-              bind:value={editingGoal.account_ids}
-              class="account-select"
-            >
-              {#each accounts as account}
-                <option value={account.account_id}>
-                  {account.name} ({formatCurrency(account.balance)})
-                </option>
+          <div class="allocations-section">
+            <div class="allocations-header">
+              <span class="form-label">Account Allocations</span>
+              <button type="button" class="btn text small" onclick={() => addEditAllocation(editingGoal!)}>
+                + Add Account
+              </button>
+            </div>
+            {#if !editingGoal.allocations || editingGoal.allocations.length === 0}
+              <p class="form-hint">No accounts linked. Goal is tracked manually.</p>
+            {:else}
+              {#each editingGoal.allocations as alloc, i}
+                <div class="allocation-row">
+                  <select bind:value={alloc.account_id} class="allocation-account">
+                    {#each accounts as account}
+                      <option value={account.account_id}>
+                        {account.name} ({formatCurrency(account.balance)})
+                      </option>
+                    {/each}
+                  </select>
+                  <select bind:value={alloc.allocation_type} class="allocation-type">
+                    <option value="percentage">%</option>
+                    <option value="fixed">$</option>
+                  </select>
+                  <input
+                    type="number"
+                    bind:value={alloc.allocation_value}
+                    class="allocation-value"
+                    min="0"
+                    max={alloc.allocation_type === "percentage" ? 100 : undefined}
+                    step={alloc.allocation_type === "percentage" ? 1 : 100}
+                  />
+                  <button
+                    type="button"
+                    class="btn-icon danger"
+                    onclick={() => removeEditAllocation(editingGoal!, i)}
+                  >
+                    ✕
+                  </button>
+                </div>
               {/each}
-            </select>
-          </label>
+            {/if}
+          </div>
         </div>
 
         <div class="modal-actions">
@@ -1214,5 +1348,72 @@
     justify-content: flex-end;
     gap: var(--spacing-sm);
     margin-top: var(--spacing-lg);
+  }
+
+  /* Allocations */
+  .allocations-section {
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: var(--spacing-md);
+    background: var(--bg-tertiary);
+  }
+
+  .allocations-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--spacing-sm);
+  }
+
+  .allocations-header .form-label {
+    margin: 0;
+    font-weight: 500;
+  }
+
+  .allocation-row {
+    display: flex;
+    gap: var(--spacing-sm);
+    align-items: center;
+    margin-bottom: var(--spacing-sm);
+  }
+
+  .allocation-row:last-child {
+    margin-bottom: 0;
+  }
+
+  .allocation-account {
+    flex: 1;
+    padding: 6px 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+  }
+
+  .allocation-type {
+    width: 50px;
+    padding: 6px 4px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+    text-align: center;
+  }
+
+  .allocation-value {
+    width: 80px;
+    padding: 6px 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-family: var(--font-mono);
+  }
+
+  .btn-icon.danger:hover {
+    color: var(--accent-danger);
   }
 </style>

@@ -150,6 +150,15 @@ export interface PluginSDK {
 // Goals Domain Types
 // ============================================================================
 
+/** How much of an account is allocated to a goal */
+export interface AccountAllocation {
+  account_id: string;
+  /** "percentage" or "fixed" */
+  allocation_type: "percentage" | "fixed";
+  /** If percentage: 0-100, if fixed: dollar amount */
+  allocation_value: number;
+}
+
 /** A savings goal */
 export interface Goal {
   id: string;
@@ -157,8 +166,8 @@ export interface Goal {
   target_amount: number;
   /** Optional deadline */
   target_date: string | null;
-  /** Account(s) to track - null means manual tracking */
-  account_ids: string[] | null;
+  /** Account allocations for this goal */
+  allocations: AccountAllocation[] | null;
   /** Starting balance when goal was created */
   starting_balance: number;
   /** Icon/emoji for the goal */
