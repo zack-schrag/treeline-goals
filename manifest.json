@@ -1,7 +1,7 @@
 {
   "id": "goals",
   "name": "Savings Goals",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Track savings goals like emergency funds, house down payments, and more",
   "author": "Treeline",
   "icon": "target",
